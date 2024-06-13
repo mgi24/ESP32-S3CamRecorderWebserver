@@ -1189,13 +1189,8 @@ static esp_err_t index_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
-        if (s->id.PID == OV3660_PID) {
-            return httpd_resp_send(req, (const char *)index_ov3660_html_gz, index_ov3660_html_gz_len);
-        } else if (s->id.PID == OV5640_PID) {
-            return httpd_resp_send(req, (const char *)index_ov5640_html_gz, index_ov5640_html_gz_len);
-        } else {
-            return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
-        }
+        return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
+
     } else {
         log_e("Camera sensor not found");
         return httpd_resp_send_500(req);
@@ -1381,14 +1376,4 @@ void startCameraServer()
     {
         httpd_register_uri_handler(stream_httpd, &stream_uri);
     }
-}
-
-void setupLedFlash(int pin) 
-{
-    #if CONFIG_LED_ILLUMINATOR_ENABLED
-    ledcSetup(LED_LEDC_CHANNEL, 5000, 8);
-    ledcAttachPin(pin, LED_LEDC_CHANNEL);
-    #else
-    log_i("LED flash is disabled -> CONFIG_LED_ILLUMINATOR_ENABLED = 0");
-    #endif
 }
