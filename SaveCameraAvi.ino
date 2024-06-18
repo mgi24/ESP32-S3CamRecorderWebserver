@@ -16,7 +16,28 @@ AsyncWebServer server(8000); //second webserver on port 8000
 #define SDMMC_CMD   38
 #define SDMMC_D0    40  
 
+//ignore this if you're not using mic
+#include "driver/i2s.h"
+#define SDMMC_CLK   39
+#define SDMMC_CMD   38
+#define SDMMC_D0    40  
+
+#define I2S_MIC_SERIAL_CLOCK 3
+#define I2S_MIC_LEFT_RIGHT_CLOCK 1
+#define I2S_MIC_SERIAL_DATA 14
+
+//audio settings
+#define SAMPLE_BUFFER_SIZE 1024
+#define SAMPLE_RATE 48000
+#define BITRATE 16
+#define CHANNEL 1
+
 ///////////////////////////////////// ALL VARIABLE IS HERE ////////////////////////////////////////////////
+//using mic or not? 1 = use 0 = not
+bool is_using_mic = true;
+int32_t buffaudio[SAMPLE_BUFFER_SIZE];
+int32_t bigbuff[SAMPLE_BUFFER_SIZE*10];// 10x loop audio for 1x frame redundancy saving
+int audiobuffleng=0;
 //start/stop the recording
 int recording=0;
 //holding camera data
@@ -33,6 +54,7 @@ int camera_go=0;
 //files
 File avifile;
 File idxfile;
+File wavfile;
 int frame_cnt = 0;
 
 
@@ -114,10 +136,89 @@ const int avi_header[AVIOFFSET] PROGMEM = {
   0x76, 0x35, 0x30, 0x20, 0x4C, 0x49, 0x53, 0x54, 0x00, 0x01, 0x0E, 0x00, 0x6D, 0x6F, 0x76, 0x69,
 };
 
+
+//I2S Settings
+// don't mess around with this
+i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0};
+
+// and don't mess around with this
+i2s_pin_config_t i2s_mic_pins = {
+    .bck_io_num = I2S_MIC_SERIAL_CLOCK,
+    .ws_io_num = I2S_MIC_LEFT_RIGHT_CLOCK,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_MIC_SERIAL_DATA};
+
+
 /////////////////////////////////////////// END OF ALL VARIABLE ///////////////////////////////
 
 
 /////////////////////////////////////////// ALL TASK ////////////////////////////////////////
+
+
+//header wav, please ignore if u dont use it
+void CreateWavHeader(byte* header, int waveDataSize){
+  uint16_t channels = CHANNEL;
+  uint32_t sampleRate = SAMPLE_RATE;
+  uint16_t bitsPerSample = BITRATE;
+  uint32_t byteRate = sampleRate * channels * bitsPerSample / 8;
+  header[0] = 'R';
+  header[1] = 'I';
+  header[2] = 'F';
+  header[3] = 'F';
+  unsigned int fileSizeMinus8 = waveDataSize + 44 - 8;
+  header[4] = (byte)(fileSizeMinus8 & 0xFF);
+  header[5] = (byte)((fileSizeMinus8 >> 8) & 0xFF);
+  header[6] = (byte)((fileSizeMinus8 >> 16) & 0xFF);
+  header[7] = (byte)((fileSizeMinus8 >> 24) & 0xFF);
+  header[8] = 'W';
+  header[9] = 'A';
+  header[10] = 'V';
+  header[11] = 'E';
+  header[12] = 'f';
+  header[13] = 'm';
+  header[14] = 't';
+  header[15] = ' ';
+  header[16] = 0x10;  // linear PCM
+  header[17] = 0x00;
+  header[18] = 0x00;
+  header[19] = 0x00;
+  header[20] = 0x01;  // linear PCM
+  header[21] = 0x00;
+  header[22] = 0x01;  // monoral
+  header[23] = 0x00;
+  header[24] = (sampleRate & 0xFF); //sample rate
+  header[25] = ((sampleRate >> 8) & 0xFF);
+  header[26] = ((sampleRate >> 16) & 0xFF);
+  header[27] = ((sampleRate >> 24) & 0xFF);
+  header[28] = (byteRate & 0xFF); //byte rate
+  header[29] = ((byteRate >> 8) & 0xFF);
+  header[30] = ((byteRate >> 16) & 0xFF);
+  header[31] = ((byteRate >> 24) & 0xFF);
+  header[32] = 0x02;  // 16bit monoral
+  header[33] = 0x00;
+  header[34] = 0x10;  // 16bit
+  header[35] = 0x00;
+  header[36] = 'd';
+  header[37] = 'a';
+  header[38] = 't';
+  header[39] = 'a';
+  header[40] = (byte)(waveDataSize & 0xFF);
+  header[41] = (byte)((waveDataSize >> 8) & 0xFF);
+  header[42] = (byte)((waveDataSize >> 16) & 0xFF);
+  header[43] = (byte)((waveDataSize >> 24) & 0xFF);
+}
+
 // Writes an uint32_t in Big Endian at current file position
 static void inline print_quartet(unsigned long i, File fd) {
 
@@ -206,6 +307,7 @@ camera_fb_t *  get_good_fb(){
 //AVI START
 void aviStart(){//injecting header in the begining of file
   
+
   File file = SD_MMC.open("/tracker.txt", FILE_WRITE);
     
     if (file) {
@@ -220,7 +322,9 @@ void aviStart(){//injecting header in the begining of file
 
   avifile = SD_MMC.open(avi_file_name, "w");
   idxfile = SD_MMC.open("/idx.tmp", "w");
-
+  if (is_using_mic){
+    wavfile = SD_MMC.open("/"+String(lastfilename)+".wav", "w");
+  }
   Serial.print("avi resolution = ");
   Serial.println(framesize);
   Serial.print("avi quality = ");
@@ -341,7 +445,12 @@ void another_save_avi(camera_fb_t * fb ){//increment fill the file with fb data
   movi_size = movi_size + remnant;
 
   avifile.flush();
-  Serial.println("SaveFrame Done!");
+  if (is_using_mic){
+    micsave();
+    Serial.println("MIC SAVED");
+    
+  }
+  
 }
 //END OF AVI SAVE FRAME
 
@@ -370,7 +479,7 @@ void end_avi(){//close the file + insert metadata like FPS etc
     uint8_t iAttainedFPS = round(fRealFPS) ;
     uint32_t us_per_frame = round(fmicroseconds_per_frame);
 
-//Modify the MJPEG header from the beginning of the file, overwriting various placeholders
+    //Modify the MJPEG header from the beginning of the file, overwriting various placeholders
 
     avifile.seek( 4 , SeekSet);
     print_quartet(movi_size + 240 + 16 * frame_cnt + 8 * frame_cnt, avifile);
@@ -433,10 +542,34 @@ void end_avi(){//close the file + insert metadata like FPS etc
     idxfile.close();
     avifile.close();
     int xx = remove("/idx.tmp");
+    if (is_using_mic){
+      int waveDataSize = int (elapsedms / 1000) * SAMPLE_RATE * BITRATE * 1 / 8;
+      wavfile.seek(0);//back to start of the file to write header
+      int headerSize = 44;
+      byte header[headerSize];
+      CreateWavHeader(header, waveDataSize);
+      wavfile.write(header, headerSize);
+      Serial.println("Mic Finish");
+      wavfile.close();
+    }
   }
 }
 
 //END OF END_AVI
+
+//GET MIC DATA
+void getmic(){
+  size_t bytes_read = 0;
+  i2s_read(I2S_NUM_0, buffaudio, sizeof(int32_t) * SAMPLE_BUFFER_SIZE, &bytes_read, portMAX_DELAY);
+  memcpy(bigbuff + audiobuffleng, buffaudio, sizeof(int32_t) * SAMPLE_BUFFER_SIZE);
+  Serial.println(audiobuffleng);
+  audiobuffleng += SAMPLE_BUFFER_SIZE;
+}
+void micsave(){
+  wavfile.write((const byte *)bigbuff, audiobuffleng * sizeof(int32_t));
+  audiobuffleng=0;
+  memset(bigbuff, 0, SAMPLE_BUFFER_SIZE * 10 * sizeof(int32_t));
+}
 
 /////////////////////////////////////////////// END OF ALL TASK //////////////////////////////////////////////////
 
@@ -458,32 +591,32 @@ void cameraloop(void *parameter) {
     }//START RECORD
     else if(recording==1 && frame_cnt==0){
       isstopped=0;
-
+      
       sensor_t * s = esp_camera_sensor_get();
       framesize = s->status.framesize ;
       quality = s->status.framesize ;
       Serial.print("avi resolution = ");
       Serial.print(framesize);
-      Serial.print(" avi quality = ");
+      Serial.print("avi quality = ");
       Serial.println(quality);
 
       frame_cnt++;
       
-      millis();
       fb_curr = get_good_fb();
-      millis();
+
+      if (is_using_mic){
+       getmic(); 
+      }
 
       aviStart();
 
-      millis();
       fb_next = get_good_fb(); 
-      millis();
 
       sd_go=1;
       
     }//SAVE ANOTHER FRAME
     else if(recording == 1 && frame_cnt>0){
-
+      
       if(camera_go==1){
         camera_go=0;
         frame_cnt++;
@@ -495,6 +628,9 @@ void cameraloop(void *parameter) {
         sd_go=1;
         fb_next = get_good_fb();  
       }
+      
+      getmic();
+
 
     }//END RECORD
     
@@ -662,6 +798,11 @@ void custom_setup(){
   Serial.println(framesize);
   Serial.print("DEFAULT CAMERA QUALITY: ");
   Serial.println(quality);
+  if (is_using_mic){
+    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_0, &i2s_mic_pins);
+  }
+  
 }
 
 ////////////////////////////////////////////// END OF SETUP  /////////////////////////////////////
@@ -704,8 +845,8 @@ void custom_setup(){
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char* ssid = "TP-Link";
-const char* password = "apalah123";
+const char* ssid = "realme";
+const char* password = "12345678";
 
 void startCameraServer();
 void setupLedFlash(int pin);
@@ -820,6 +961,5 @@ void setup() {
 }
 
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
-  delay(10000);
+ delay(10000);
 }
