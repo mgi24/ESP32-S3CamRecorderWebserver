@@ -1,4 +1,3 @@
-
 //ESP32 Simple Camera Recorder to SD by MMV Project
 //modified from jamezah junior recorder
 //Make sure to take care of temp problem, esp32 camera can get very hot and destroy itself without sufficient cooling!!!
@@ -14,57 +13,99 @@ AsyncWebServer server(8000); //second webserver on port 8000
 //Edit this if you have different pin configuration
 #define SDMMC_CLK   39
 #define SDMMC_CMD   38
-#define SDMMC_D0    40  
+#define SDMMC_D0    40 
+#define SDMMC_D1    41 
+#define SDMMC_D2    42 
+#define SDMMC_D3    47
 
-//ignore this if you're not using mic
-#include "driver/i2s.h"
-#define SDMMC_CLK   39
-#define SDMMC_CMD   38
-#define SDMMC_D0    40  
+bool is_mic = true; //EDIT TO FALSE IF U ARE NOT USING i2S MIC 
 
+#include "driver/i2s.h"//MIC ignore if u don't use it
 #define I2S_MIC_SERIAL_CLOCK 3
 #define I2S_MIC_LEFT_RIGHT_CLOCK 1
 #define I2S_MIC_SERIAL_DATA 14
 
-//audio settings
 #define SAMPLE_BUFFER_SIZE 1024
 #define SAMPLE_RATE 48000
 #define BITRATE 16
-#define CHANNEL 1
+#define CHANNEL 1;
+
+//pin for manual start / stop recording & long press take picture!
+#define CAPTURE_BTN 2
+
+//pin for indicator
+#define MAIN_LED LED_BUILTIN
+
+//make sure the bit/sample is correct!
+i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0};
+
+i2s_pin_config_t i2s_mic_pins = {
+    .bck_io_num = I2S_MIC_SERIAL_CLOCK,
+    .ws_io_num = I2S_MIC_LEFT_RIGHT_CLOCK,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_MIC_SERIAL_DATA};
 
 ///////////////////////////////////// ALL VARIABLE IS HERE ////////////////////////////////////////////////
-//using mic or not? 1 = use 0 = not
-bool is_using_mic = true;
-int32_t buffaudio[SAMPLE_BUFFER_SIZE];
-int32_t bigbuff[SAMPLE_BUFFER_SIZE*10];// 10x loop audio for 1x frame redundancy saving
-int audiobuffleng=0;
+String ssid = "Your WIFI SSID";
+String password = "Insert your password";
+
 //start/stop the recording
 int recording=0;
 //holding camera data
 int framesize;
 int quality;
+int frame_cnt = 0;
+float fps;
+
+//sdcard failed notifier
+bool sdfail = 0;
+
 //file name increment for avi
 int lastfilename;
+
 //handle task
 TaskHandle_t Cameraloop;
 TaskHandle_t SDloop;
+TaskHandle_t Audioloop;
+TaskHandle_t Blinkloop;
+
 //semaphore resource
-int sd_go=0;
-int camera_go=0;
+int sd_go=0;//saving frame to SD
+int camera_go=0;//taking frame buffer
+bool audiorecord = false;//takind i2s buffer
+bool i2s_go=true;//saving i2s buff to sd
+
 //files
 File avifile;
 File idxfile;
 File wavfile;
-int frame_cnt = 0;
+File photofile;
 
+//audio variable
+int32_t audiobuff[SAMPLE_BUFFER_SIZE];//for taking i2s buffer
+int32_t bigbuff[SAMPLE_BUFFER_SIZE*10];// save buffer audio on bigger buffer, then save it to sd at once!
+int audiobuffleng=0;
 
 #define AVIOFFSET 240 // AVI main header length
-#define BUFFSIZE 512
+#define BUFFSIZE 512 //for injecting avi header
 uint8_t buf[BUFFSIZE];
+
 //log
 int normal_jpg = 0;
 int extend_jpg = 0;
 int bad_jpg = 0;
+
 //frame buffer
 camera_fb_t * fb_curr = NULL;
 camera_fb_t * fb_next = NULL;
@@ -73,13 +114,18 @@ unsigned long jpeg_size = 0;
 unsigned long movi_size = 0;
 unsigned long idx_offset = 0;
 
+//timer
 uint32_t startms;
+
+//SOME BUFFER
+
 #define fbs 8 // was 64 -- how many kb of static ram for psram -> sram buffer for sd write
 uint8_t framebuffer_static[fbs * 1024 + 20];
 struct frameSizeStruct {
   uint8_t frameWidth[2];
   uint8_t frameHeight[2];
 };
+
 uint8_t zero_buf[4] = {0x00, 0x00, 0x00, 0x00};
 uint8_t dc_buf[4] = {0x30, 0x30, 0x64, 0x63};    // "00dc"
 uint8_t dc_and_zero_buf[8] = {0x30, 0x30, 0x64, 0x63, 0x00, 0x00, 0x00, 0x00};
@@ -89,6 +135,7 @@ uint8_t idx1_buf[4] = {0x69, 0x64, 0x78, 0x31};    // "idx1"
 //  data structure from here https://github.com/s60sc/ESP32-CAM_MJPEG2SD/blob/master/avi.cpp, extended for ov5640
 
 
+//AVI RESOLUTION SETTINGS
 static const frameSizeStruct frameSizeData[] = {
   {{0x60, 0x00}, {0x60, 0x00}}, // FRAMESIZE_96X96,    // 96x96
   {{0xA0, 0x00}, {0x78, 0x00}}, // FRAMESIZE_QQVGA,    // 160x120
@@ -137,36 +184,37 @@ const int avi_header[AVIOFFSET] PROGMEM = {
 };
 
 
-//I2S Settings
-// don't mess around with this
-i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
-    .dma_buf_len = 1024,
-    .use_apll = false,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk = 0};
-
-// and don't mess around with this
-i2s_pin_config_t i2s_mic_pins = {
-    .bck_io_num = I2S_MIC_SERIAL_CLOCK,
-    .ws_io_num = I2S_MIC_LEFT_RIGHT_CLOCK,
-    .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = I2S_MIC_SERIAL_DATA};
-
-
 /////////////////////////////////////////// END OF ALL VARIABLE ///////////////////////////////
 
 
-/////////////////////////////////////////// ALL TASK ////////////////////////////////////////
+/////////////////////////////////////////// ALL TASK ///////////////////////////////////////////
 
+// Writes an uint32_t in Big Endian at current file position
+static void inline print_quartet(unsigned long i, File fd) {
 
-//header wav, please ignore if u dont use it
+  uint8_t y[4];
+  y[0] = i % 0x100;
+  y[1] = (i >> 8) % 0x100;
+  y[2] = (i >> 16) % 0x100;
+  y[3] = (i >> 24) % 0x100;
+  size_t i1_err = fd.write(y , 4);
+}
+// Writes 2 uint32_t in Big Endian at current file position
+static void inline print_2quartet(unsigned long i, unsigned long j, File fd) {
+
+  uint8_t y[8];
+  y[0] = i % 0x100;
+  y[1] = (i >> 8) % 0x100;
+  y[2] = (i >> 16) % 0x100;
+  y[3] = (i >> 24) % 0x100;
+  y[4] = j % 0x100;
+  y[5] = (j >> 8) % 0x100;
+  y[6] = (j >> 16) % 0x100;
+  y[7] = (j >> 24) % 0x100;
+  size_t i1_err = fd.write(y , 8);
+}
+
+//WAV HEADER
 void CreateWavHeader(byte* header, int waveDataSize){
   uint16_t channels = CHANNEL;
   uint32_t sampleRate = SAMPLE_RATE;
@@ -218,31 +266,18 @@ void CreateWavHeader(byte* header, int waveDataSize){
   header[42] = (byte)((waveDataSize >> 16) & 0xFF);
   header[43] = (byte)((waveDataSize >> 24) & 0xFF);
 }
-
-// Writes an uint32_t in Big Endian at current file position
-static void inline print_quartet(unsigned long i, File fd) {
-
-  uint8_t y[4];
-  y[0] = i % 0x100;
-  y[1] = (i >> 8) % 0x100;
-  y[2] = (i >> 16) % 0x100;
-  y[3] = (i >> 24) % 0x100;
-  size_t i1_err = fd.write(y , 4);
+void incrementtracker(){
+  lastfilename++;
+  File file = SD_MMC.open("/tracker.txt", FILE_WRITE);
+  if (file) {
+      file.println(lastfilename);
+      file.close();
+      Serial.println("Tracker updated!");
+  } else {
+      Serial.println("Gagal membuka file untuk ditulis.");
+  }
 }
-// Writes 2 uint32_t in Big Endian at current file position
-static void inline print_2quartet(unsigned long i, unsigned long j, File fd) {
 
-  uint8_t y[8];
-  y[0] = i % 0x100;
-  y[1] = (i >> 8) % 0x100;
-  y[2] = (i >> 16) % 0x100;
-  y[3] = (i >> 24) % 0x100;
-  y[4] = j % 0x100;
-  y[5] = (j >> 8) % 0x100;
-  y[6] = (j >> 16) % 0x100;
-  y[7] = (j >> 24) % 0x100;
-  size_t i1_err = fd.write(y , 8);
-}
 
 //MAKE SURE ITS GOOD FRAME BUFFER
 camera_fb_t *  get_good_fb(){
@@ -306,25 +341,12 @@ camera_fb_t *  get_good_fb(){
 
 //AVI START
 void aviStart(){//injecting header in the begining of file
-  
-
-  File file = SD_MMC.open("/tracker.txt", FILE_WRITE);
-    
-    if (file) {
-        file.println(lastfilename);
-        file.close();
-        Serial.println("Berhasil update nama file.");
-    } else {
-        Serial.println("Gagal membuka file untuk ditulis.");
-    }
   Serial.println("Starting an avi ");
   String avi_file_name = "/"+String(lastfilename)+".avi";
 
   avifile = SD_MMC.open(avi_file_name, "w");
   idxfile = SD_MMC.open("/idx.tmp", "w");
-  if (is_using_mic){
-    wavfile = SD_MMC.open("/"+String(lastfilename)+".wav", "w");
-  }
+
   Serial.print("avi resolution = ");
   Serial.println(framesize);
   Serial.print("avi quality = ");
@@ -367,6 +389,7 @@ void aviStart(){//injecting header in the begining of file
   
 }
 // END OF AVISTART
+
 
 //AVI SAVE FRAME
 
@@ -412,6 +435,8 @@ void another_save_avi(camera_fb_t * fb ){//increment fill the file with fb data
   if (err != fb_block_length) {
     Serial.print("Error on avi write: err = "); Serial.print(err);
     Serial.print(" len = "); Serial.println(fb_block_length);
+    recording=0; //cancel recording, usually because SD not inserted!!!
+    sdfail = 1;
   }
   while (fblen > 0) {
 
@@ -445,13 +470,9 @@ void another_save_avi(camera_fb_t * fb ){//increment fill the file with fb data
   movi_size = movi_size + remnant;
 
   avifile.flush();
-  if (is_using_mic){
-    micsave();
-    Serial.println("MIC SAVED");
-    
-  }
-  
+  //Serial.println("SaveFrame Done!");
 }
+
 //END OF AVI SAVE FRAME
 
 //START OF END AVI
@@ -542,7 +563,10 @@ void end_avi(){//close the file + insert metadata like FPS etc
     idxfile.close();
     avifile.close();
     int xx = remove("/idx.tmp");
-    if (is_using_mic){
+
+    //REMOVE CODE BELOW UNTIL END OF AVI IF U DON'T USE AUDIO!!!
+    
+    if (is_mic){
       int waveDataSize = int (elapsedms / 1000) * SAMPLE_RATE * BITRATE * 1 / 8;
       wavfile.seek(0);//back to start of the file to write header
       int headerSize = 44;
@@ -557,32 +581,137 @@ void end_avi(){//close the file + insert metadata like FPS etc
 
 //END OF END_AVI
 
-//GET MIC DATA
-void getmic(){
-  size_t bytes_read = 0;
-  i2s_read(I2S_NUM_0, buffaudio, sizeof(int32_t) * SAMPLE_BUFFER_SIZE, &bytes_read, portMAX_DELAY);
-  memcpy(bigbuff + audiobuffleng, buffaudio, sizeof(int32_t) * SAMPLE_BUFFER_SIZE);
-  Serial.println(audiobuffleng);
-  audiobuffleng += SAMPLE_BUFFER_SIZE;
-}
-void micsave(){
-  wavfile.write((const byte *)bigbuff, audiobuffleng * sizeof(int32_t));
-  audiobuffleng=0;
-  memset(bigbuff, 0, SAMPLE_BUFFER_SIZE * 10 * sizeof(int32_t));
+//TAKE PICTURE ONLY
+void takepic(){
+  sensor_t *s = esp_camera_sensor_get();
+  framesize = s->status.framesize ;
+  quality = s->status.quality ;
+  s->set_framesize(s, (framesize_t)13);//max res UXGA
+  s->set_quality(s, 4);//max quality
+  camera_fb_t * fb = NULL;
+  digitalWrite(MAIN_LED, HIGH);
+  delay(1000);
+  fb = esp_camera_fb_get();
+  digitalWrite(MAIN_LED, LOW);
+  if(!fb) {
+    Serial.println("Camera capture failed");
+    return;
+  }
+  photofile = SD_MMC.open("/"+String(lastfilename)+".jpg", "w");
+  photofile.write(fb->buf, fb->len);
+  photofile.close();
+  esp_camera_fb_return(fb); 
+  s->set_framesize(s, (framesize_t)framesize);//back to original setting
+  s->set_quality(s, quality);
 }
 
 /////////////////////////////////////////////// END OF ALL TASK //////////////////////////////////////////////////
 
 
 ////////////////////////////////////////////////// MAIN LOOP START ///////////////////////////////////////////// 
+
+//MAIN LOOP
+long buttontimer;
+bool is_btn=0;//did already pressed before?
+
+void buttonloop(){
+  if (analogRead(CAPTURE_BTN) <1000){
+    buttontimer = millis();
+    is_btn=1;
+    while(analogRead(CAPTURE_BTN) <1000) {
+    if(millis() - buttontimer > 1000){
+      break;
+      }
+    }
+    if(is_btn){
+      is_btn=0;
+      long pressDuration = millis() - buttontimer;
+      if (pressDuration < 1000) {//quick relese = record
+        if(recording==1){
+          recording = 0;
+        }
+        else{
+          sensor_t *s = esp_camera_sensor_get();
+          s->set_framesize(s, (framesize_t)9);//VGA 800x600
+          s->set_quality(s, quality);
+          recording = 1;
+        }
+      } else {//long release = photo
+        incrementtracker();
+        takepic();
+      }
+    }
+  }
+  delay(100);
+  
+}
+
 //CORE 0
+
+//LED BLINKING RECORDING
+void blinkloop(void *parameter){
+  Serial.print("BLINK LOOP using core ");  Serial.print(xPortGetCoreID());
+  Serial.print(", priority = "); Serial.println(uxTaskPriorityGet(NULL));
+  while(true){
+    if (recording==1){
+      digitalWrite(MAIN_LED, HIGH);  
+      delay(500);                      
+      digitalWrite(MAIN_LED, LOW);   
+      delay(500); 
+    }
+    else{
+      if (sdfail){
+        digitalWrite(MAIN_LED, HIGH);  
+      }
+      else{
+        digitalWrite(MAIN_LED, LOW);
+      }
+      vTaskDelay(1000/portTICK_PERIOD_MS);
+    }
+  }
+}
+
+//AUDIO LOOP
+void audioloop(void *parameter){
+  Serial.print("AUDIO LOOP using core ");  Serial.print(xPortGetCoreID());
+  Serial.print(", priority = "); Serial.println(uxTaskPriorityGet(NULL));
+  
+  while (is_mic){
+    
+    if(audiorecord){
+      if(i2s_go){
+        if (audiobuffleng + SAMPLE_BUFFER_SIZE > SAMPLE_BUFFER_SIZE*10){
+          memset(bigbuff, 0, SAMPLE_BUFFER_SIZE * 10 * sizeof(int32_t));
+          audiobuffleng=0;
+        }
+
+        size_t bytes_read = 0;
+        i2s_read(I2S_NUM_0, audiobuff, sizeof(int32_t) * SAMPLE_BUFFER_SIZE, &bytes_read, portMAX_DELAY);
+        memcpy(bigbuff + audiobuffleng, audiobuff, sizeof(int32_t) * SAMPLE_BUFFER_SIZE);
+        audiobuffleng += SAMPLE_BUFFER_SIZE;
+        
+        
+      }
+      else{
+        wavfile.write((const byte *)bigbuff, audiobuffleng * sizeof(int32_t));
+        memset(bigbuff, 0, SAMPLE_BUFFER_SIZE * 10 * sizeof(int32_t));
+        audiobuffleng=0;
+        i2s_go=true;
+      }
+
+    }
+    vTaskDelay(portTICK_PERIOD_MS);
+  }
+}
+
+//CAMERA MAIN LOOP
 void cameraloop(void *parameter) {
   Serial.print("CAMERA LOOP using core ");  Serial.print(xPortGetCoreID());
   Serial.print(", priority = "); Serial.println(uxTaskPriorityGet(NULL));
   int isstopped = 0;
   
   while (true) {
-    
+    //NOT RECORDING
     if (recording == 0 && frame_cnt ==0){
       if (isstopped ==0){
         Serial.println("NOT RECORDING");
@@ -590,25 +719,23 @@ void cameraloop(void *parameter) {
       }
     }//START RECORD
     else if(recording==1 && frame_cnt==0){
+      incrementtracker();
       isstopped=0;
-      
+      wavfile = SD_MMC.open("/"+String(lastfilename)+".wav", "w");
       sensor_t * s = esp_camera_sensor_get();
       framesize = s->status.framesize ;
-      quality = s->status.framesize ;
+      quality = s->status.quality ;
       Serial.print("avi resolution = ");
       Serial.print(framesize);
-      Serial.print("avi quality = ");
+      Serial.print(" avi quality = ");
       Serial.println(quality);
 
-      frame_cnt++;
-      
+      frame_cnt++;      
+
       fb_curr = get_good_fb();
 
-      if (is_using_mic){
-       getmic(); 
-      }
-
       aviStart();
+      audiorecord = 1;
 
       fb_next = get_good_fb(); 
 
@@ -616,7 +743,7 @@ void cameraloop(void *parameter) {
       
     }//SAVE ANOTHER FRAME
     else if(recording == 1 && frame_cnt>0){
-      
+      long fpscounter = millis();
       if(camera_go==1){
         camera_go=0;
         frame_cnt++;
@@ -628,10 +755,10 @@ void cameraloop(void *parameter) {
         sd_go=1;
         fb_next = get_good_fb();  
       }
-      
-      getmic();
-
-
+      if (millis()-fpscounter==0){
+        fpscounter = 1;
+      }
+      fps = 1000/(millis()-fpscounter);
     }//END RECORD
     
     else if(recording==0&& frame_cnt>0){
@@ -645,10 +772,10 @@ void cameraloop(void *parameter) {
         fb_next = NULL;
 
         another_save_avi(fb_curr);
-
         esp_camera_fb_return(fb_curr);
-        fb_curr = NULL;
 
+        fb_curr = NULL;
+        audiorecord = 0;
         end_avi();
         
         float fps = 1.0 * frame_cnt / ((millis() - startms) / 1000) ;
@@ -673,7 +800,8 @@ void sdloop(void *parameter) {
   while (true) {
     if(sd_go==1){//i use int because i failed to use xsemaphor
       sd_go=0;
-      another_save_avi(fb_curr);                        // do the actual sd wrte
+      another_save_avi(fb_curr);    // do the actual sd wrte
+      i2s_go = false;               // saving i2s buffer
       camera_go=1;
     }
     vTaskDelay(portTICK_PERIOD_MS);
@@ -687,28 +815,29 @@ void sdloop(void *parameter) {
 ////////////////////////////////////////////// SETUP / INIT /////////////////////////////////////
 //initialize SD for the first time / setup
 void SD_init(){
-  SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0);
-  //Set sd speed to 20Mhz, if not set not gonna work in ESP32-s3, try to get it back to 40Mhz if possible
-  if(!SD_MMC.begin("/sdcard", true, false, 20000, 5)){
+  SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0 , SDMMC_D1, SDMMC_D2, SDMMC_D3);
+  //if u use only 1 bit sdio mode
+  /////////////////"/sdcard", true , false, 20000, 5
+  if(!SD_MMC.begin("/sdcard", false, false, 40000, 5)){//its default config
     Serial.println("Card Mount Failed");
+    sdfail = 1;
     return;
   }
   else{//make sure you have already have tracker.txt on sdcard, with number in it
     File file = SD_MMC.open("/tracker.txt");
     
     if (file) {
-      if (file) {
-          if (file.available()) {
-              lastfilename = file.parseInt();
-          }
-          file.close();
-      } else {
-          Serial.println("Gagal membuka file untuk dibaca.");
+      if (file.available()) {
+        lastfilename = file.parseInt();
+      }
+        
+      else {
+        Serial.println("Gagal membuka file untuk dibaca.");
       }
       Serial.print("Nomor file terakhir ");
       Serial.println(lastfilename);
+      file.close();
     }
-
 
     uint8_t cardType = SD_MMC.cardType();
     if(cardType == CARD_NONE){
@@ -731,8 +860,31 @@ void SD_init(){
     Serial.printf("SD_MMC Card Size: %lluMB\n", cardSize);
   }
 }
-void custom_setup(){
+void wifisetup(){
+    File file = SD_MMC.open("/wifi.txt");
+    ssid = file.readStringUntil('\n');
+    ssid.trim(); // remove whitespace
+    password = file.readStringUntil('\n');
+    password.trim();
+    file.close();
+}
+
+//ALL OTHER SETUP
+void initial_setup(){
   SD_init();
+  wifisetup();
+  //BTN manual start
+  pinMode(CAPTURE_BTN, INPUT);
+  pinMode(MAIN_LED, OUTPUT);
+  delay(500);//charging capacitor for low power supply!
+  digitalWrite(MAIN_LED, HIGH);
+}
+void custom_setup(){
+
+  if(is_mic){
+    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_NUM_0, &i2s_mic_pins);
+  }
   Serial.print("setup using core ");  Serial.print(xPortGetCoreID());
   Serial.print(", priority = "); Serial.println(uxTaskPriorityGet(NULL));
   //website that work on port 8000
@@ -747,43 +899,56 @@ void custom_setup(){
     recording = 0;
     request->send(200, "text/html", html);
   });
-  server.on("/start", HTTP_GET, [](AsyncWebServerRequest *request) {
+
+  server.on("/start", HTTP_GET, [](AsyncWebServerRequest* request) {
     recording = 1;
-    lastfilename++;
-    request->send_P(200, "text/html", R"rawliteral(
-      <!DOCTYPE HTML><html>
-      <head>
-        <title>ESP32 Web Server</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-      </head>
-      <body>
-        <h1>ESP32 Web Server</h1>
-        <p>Recording...</p>
-        <p><button onclick="stopRecording()">Stop Recording</button></p>
-        <script>
-          function stopRecording() {
-            window.location.href = "/";
-          }
-        </script>
-      </body>
-      </html>
-    )rawliteral");
+    
+    String html = "<!DOCTYPE HTML><html><head><title>ESP32 Web Server - Rekam</title>";
+    html += "<meta http-equiv=\"refresh\" content=\"1\"></head><body>";
+    html += "<h1>Rekaman Dimulai</h1>";
+    html += "<p>Lama Rekam:"+ String ((millis()-startms)/1000) +" detik </p>";
+    html += "<p>FPS:"+ String (fps) +" </p>";
+    html += "<button onclick=\"location.href='/'\">Stop Recording</button>";
+    html += "</body></html>";
+    request->send(200, "text/html", html);
   });
+  
   
   server.begin();//server on port 8000
 
-  //split workload to 2 core 
+  //RUNNING ON CORE 0
   xTaskCreatePinnedToCore(
     cameraloop,     // Fungsi untuk task1
     "Cameraloop",   // Nama task1
     10000,     // Ukuran stack
     NULL,      // Parameter task1
-    1,         // Prioritas task1
+    3,         // Prioritas task1
     &Cameraloop,    // Handle task1
     0          // Jalankan pada core 0
   );
-  delay(200);
-    // Menjalankan task2 pada core 1
+  delay(100);
+  xTaskCreatePinnedToCore(
+    audioloop,     // Fungsi untuk task1
+    "Audioloop",   // Nama task1
+    10000,     // Ukuran stack
+    NULL,      // Parameter task1
+    2,         // Prioritas task1
+    &Audioloop,    // Handle task1
+    0          // Jalankan pada core 0
+  );
+  delay(100);
+  xTaskCreatePinnedToCore(
+    blinkloop,     // Fungsi untuk task1
+    "Blinkloop",   // Nama task1
+    10000,     // Ukuran stack
+    NULL,      // Parameter task1
+    1,         // Prioritas task1
+    &Blinkloop,    // Handle task1
+    0          // Jalankan pada core 0
+  );
+  delay(100);
+
+  // RUNNING ON CORE 1
   xTaskCreatePinnedToCore(
     sdloop,     // Fungsi untuk task2
     "SDloop",   // Nama task2
@@ -798,11 +963,8 @@ void custom_setup(){
   Serial.println(framesize);
   Serial.print("DEFAULT CAMERA QUALITY: ");
   Serial.println(quality);
-  if (is_using_mic){
-    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-    i2s_set_pin(I2S_NUM_0, &i2s_mic_pins);
-  }
-  
+  digitalWrite(MAIN_LED, LOW);//stop warning light
+
 }
 
 ////////////////////////////////////////////// END OF SETUP  /////////////////////////////////////
@@ -845,8 +1007,8 @@ void custom_setup(){
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char* ssid = "realme";
-const char* password = "12345678";
+
+//already stated above!
 
 void startCameraServer();
 void setupLedFlash(int pin);
@@ -855,7 +1017,7 @@ void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
-
+  initial_setup();
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -953,13 +1115,13 @@ void setup() {
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.localIP());
   Serial.println("' to connect");
-  //this line is not part of camerawebserver example!
   
+  //this line is not part of camerawebserver example!
   framesize = s->status.framesize ;
-  quality = s->status.framesize ;
+  quality = s->status.quality ;
   custom_setup();
 }
 
 void loop() {
- delay(10000);
+  buttonloop();
 }
