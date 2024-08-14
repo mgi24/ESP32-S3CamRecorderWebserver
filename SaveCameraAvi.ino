@@ -16,14 +16,14 @@ AsyncWebServer server(8000); //second webserver on port 8000
 #define SDMMC_D0    40 
 #define SDMMC_D1    41 
 #define SDMMC_D2    42 
-#define SDMMC_D3    47
+#define SDMMC_D3    14
 
 bool is_mic = true; //EDIT TO FALSE IF U ARE NOT USING i2S MIC 
 
 #include "driver/i2s.h"//MIC ignore if u don't use it
-#define I2S_MIC_SERIAL_CLOCK 3
-#define I2S_MIC_LEFT_RIGHT_CLOCK 1
-#define I2S_MIC_SERIAL_DATA 14
+#define I2S_MIC_SERIAL_CLOCK 21
+#define I2S_MIC_LEFT_RIGHT_CLOCK 47
+#define I2S_MIC_SERIAL_DATA 3
 
 #define SAMPLE_BUFFER_SIZE 1024
 #define SAMPLE_RATE 48000
@@ -57,8 +57,8 @@ i2s_pin_config_t i2s_mic_pins = {
     .data_in_num = I2S_MIC_SERIAL_DATA};
 
 ///////////////////////////////////// ALL VARIABLE IS HERE ////////////////////////////////////////////////
-String ssid = "Your WIFI SSID";
-String password = "Insert your password";
+String APssid = "ESP 32 Camera";
+String APpassword = "";
 
 //start/stop the recording
 int recording=0;
@@ -84,6 +84,7 @@ TaskHandle_t Blinkloop;
 int sd_go=0;//saving frame to SD
 int camera_go=0;//taking frame buffer
 bool audiorecord = false;//takind i2s buffer
+
 bool i2s_go=true;//saving i2s buff to sd
 
 //files
@@ -605,6 +606,8 @@ void takepic(){
   s->set_quality(s, quality);
 }
 
+
+
 /////////////////////////////////////////////// END OF ALL TASK //////////////////////////////////////////////////
 
 
@@ -633,7 +636,6 @@ void buttonloop(){
         else{
           sensor_t *s = esp_camera_sensor_get();
           s->set_framesize(s, (framesize_t)9);//VGA 800x600
-          s->set_quality(s, quality);
           recording = 1;
         }
       } else {//long release = photo
@@ -862,9 +864,9 @@ void SD_init(){
 }
 void wifisetup(){
     File file = SD_MMC.open("/wifi.txt");
-    ssid = file.readStringUntil('\n');
+    String ssid = file.readStringUntil('\n');
     ssid.trim(); // remove whitespace
-    password = file.readStringUntil('\n');
+    String password = file.readStringUntil('\n');
     password.trim();
     file.close();
 }
@@ -895,8 +897,11 @@ void custom_setup(){
     html += "<body><h1>Nomor file: " + String(lastfilename) + "</h1>";
     html += "<p>Status: Not Recording </p>";
     html += "<form action=\"/start\" method=\"get\"><button type=\"submit\">Start Record</button></form>";
+
+    html += "<form action=\"/file\" method=\"get\"><button type=\"submit\">Download File</button></form>";
     html += "</body></html>";
     recording = 0;
+
     request->send(200, "text/html", html);
   });
 
@@ -911,6 +916,36 @@ void custom_setup(){
     html += "<button onclick=\"location.href='/'\">Stop Recording</button>";
     html += "</body></html>";
     request->send(200, "text/html", html);
+  });
+
+
+
+  server.on("/file", HTTP_GET, [](AsyncWebServerRequest *request){
+    String html = "<html><body><h1>SD Card Files</h1><p>Change filename + extension after download done!</p><ul>";
+    File root = SD_MMC.open("/");
+    File file = root.openNextFile();
+    while (file) {
+      if (!file.isDirectory()) {
+        html += "<li><a href=\"/download?file=" + String(file.name()) + "\">" + String(file.name()) + "</a></li>";
+      }
+      file = root.openNextFile();
+    }
+    html += "</ul></body></html>";
+    request->send(200, "text/html", html);
+  });
+
+  server.on("/download", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("file")) {
+      String filename = request->getParam("file")->value();
+      filename = "/"+filename;
+      if (SD_MMC.exists(filename)) {
+        request->send(SD_MMC, filename, "application/octet-stream");
+      } else {
+        request->send(404, "text/plain", "File not found");
+      }
+    } else {
+      request->send(400, "text/plain", "Bad Request");
+    }
   });
   
   
@@ -932,9 +967,9 @@ void custom_setup(){
     "Audioloop",   // Nama task1
     10000,     // Ukuran stack
     NULL,      // Parameter task1
-    2,         // Prioritas task1
+    4,         // Prioritas task1
     &Audioloop,    // Handle task1
-    0          // Jalankan pada core 0
+    1          // Jalankan pada core 0
   );
   delay(100);
   xTaskCreatePinnedToCore(
@@ -942,9 +977,9 @@ void custom_setup(){
     "Blinkloop",   // Nama task1
     10000,     // Ukuran stack
     NULL,      // Parameter task1
-    1,         // Prioritas task1
+    2,         // Prioritas task1
     &Blinkloop,    // Handle task1
-    0          // Jalankan pada core 0
+    1          // Jalankan pada core 0
   );
   delay(100);
 
@@ -954,7 +989,7 @@ void custom_setup(){
     "SDloop",   // Nama task2
     10000,     // Ukuran stack
     NULL,      // Parameter task2
-    2,         // Prioritas task2
+    3,         // Prioritas task2
     &SDloop,    // Handle task2
     1          // Jalankan pada core 1
   );
@@ -1100,20 +1135,16 @@ void setup() {
   s->set_hmirror(s, 1);
 #endif
 
-  WiFi.begin(ssid, password);
+  WiFi.softAP(APssid);
   WiFi.setSleep(false);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
   Serial.println("");
   Serial.println("WiFi connected");
 
   startCameraServer();
 
   Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
+  Serial.print(WiFi.softAPIP());
   Serial.println("' to connect");
   
   //this line is not part of camerawebserver example!
