@@ -16,14 +16,14 @@ AsyncWebServer server(8000); //second webserver on port 8000
 #define SDMMC_D0    40 
 #define SDMMC_D1    41 
 #define SDMMC_D2    42 
-#define SDMMC_D3    14
+#define SDMMC_D3    1
 
 bool is_mic = true; //EDIT TO FALSE IF U ARE NOT USING i2S MIC 
 
 #include "driver/i2s.h"//MIC ignore if u don't use it
 #define I2S_MIC_SERIAL_CLOCK 21
 #define I2S_MIC_LEFT_RIGHT_CLOCK 47
-#define I2S_MIC_SERIAL_DATA 3
+#define I2S_MIC_SERIAL_DATA 14
 
 #define SAMPLE_BUFFER_SIZE 1024
 #define SAMPLE_RATE 48000
@@ -94,8 +94,8 @@ File wavfile;
 File photofile;
 
 //audio variable
-int32_t audiobuff[SAMPLE_BUFFER_SIZE];//for taking i2s buffer
-int32_t bigbuff[SAMPLE_BUFFER_SIZE*10];// save buffer audio on bigger buffer, then save it to sd at once!
+int16_t audiobuff[SAMPLE_BUFFER_SIZE];//for taking i2s buffer
+int16_t bigbuff[SAMPLE_BUFFER_SIZE*10];// save buffer audio on bigger buffer, then save it to sd at once!
 int audiobuffleng=0;
 
 #define AVIOFFSET 240 // AVI main header length
@@ -683,20 +683,20 @@ void audioloop(void *parameter){
     if(audiorecord){
       if(i2s_go){
         if (audiobuffleng + SAMPLE_BUFFER_SIZE > SAMPLE_BUFFER_SIZE*10){
-          memset(bigbuff, 0, SAMPLE_BUFFER_SIZE * 10 * sizeof(int32_t));
+          memset(bigbuff, 0, SAMPLE_BUFFER_SIZE * 10 * sizeof(int16_t));
           audiobuffleng=0;
         }
 
         size_t bytes_read = 0;
-        i2s_read(I2S_NUM_0, audiobuff, sizeof(int32_t) * SAMPLE_BUFFER_SIZE, &bytes_read, portMAX_DELAY);
-        memcpy(bigbuff + audiobuffleng, audiobuff, sizeof(int32_t) * SAMPLE_BUFFER_SIZE);
+        i2s_read(I2S_NUM_0, audiobuff, sizeof(int16_t) * SAMPLE_BUFFER_SIZE, &bytes_read, portMAX_DELAY);
+        memcpy(bigbuff + audiobuffleng, audiobuff, sizeof(int16_t) * SAMPLE_BUFFER_SIZE);
         audiobuffleng += SAMPLE_BUFFER_SIZE;
         
         
       }
       else{
-        wavfile.write((const byte *)bigbuff, audiobuffleng * sizeof(int32_t));
-        memset(bigbuff, 0, SAMPLE_BUFFER_SIZE * 10 * sizeof(int32_t));
+        wavfile.write((const byte *)bigbuff, audiobuffleng * sizeof(int16_t));
+        memset(bigbuff, 0, SAMPLE_BUFFER_SIZE * 10 * sizeof(int16_t));
         audiobuffleng=0;
         i2s_go=true;
       }
